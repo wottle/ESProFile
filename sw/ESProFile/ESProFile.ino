@@ -15,12 +15,18 @@
 #include "EEPROM.h"
 
 // Include this pin definition file if you've got a standard ESProFile board
-#include "PinDefs_ESProFile.h"
+//#include "PinDefs_ESProFile.h"
 // But include this one instead if you're using the ESProFile that's built into the LisaFPGA board
-//#include "PinDefs_LisaFPGA.h"
+// (LisaNet branch: the LisaFPGA board is the only target, since LisaNet needs its FPGA)
+#include "PinDefs_LisaFPGA.h"
+#include "lisanet.h"
 
 // The entire purpose of this file is to pick whether we want to run ESProFile_Diagnostic.ino or ESProFile_Emulator.ino
 void setup(){
+  // LisaNet: in the LisaFPGA menu's ESP32 MODE = WIFI HDD, become the WiFi board's SD-card server instead
+  if(lisanetModeRequestedAtBoot()){
+    sdServerMain(); // Never returns
+  }
   pinMode(switch_pin, INPUT); // Set the switch pin to an input
   bool switchState = digitalRead(switch_pin); // Read its state
   pinMode(red_led, OUTPUT); // Set the red LED to an output

@@ -63,6 +63,12 @@ uint32_t uptime = 0; // The number of seconds that the ESProFile has been runnin
 
 bool selectorCommandRun = true; // This gets set to true if any Selector command is run
 
+// LisaNet MODE watcher state (see lisanetIdlePoll() below; NOT part of upstream ESProFile)
+uint32_t lisanetStableCycles; // LISANET_MODE_STABLE_MS in CPU cycles
+uint32_t lisanetSince;        // cycle count when MODE went high
+bool lisanetHigh = false;     // MODE currently high
+bool lisanetLinkSeen = false; // the link input has been high since then
+
 void emulatorSetup(){
   // We need to disable the interrupt watchdog timer; we disable interrupts for so long that the watchdog triggers and ruins everything
   REG_WRITE(TIMG1_WDT_WE_REG, TIMG1_WDT_WE); // Enable writing to the watchdog timer registers
@@ -91,12 +97,50 @@ void emulatorSetup(){
   updateSpareTable(); // If all this succeeds, update the spare table to reflect the attributes of the current disk image
   setLEDColor(0, 1); // Make the LED green to show that the ESProFile is ready
   Serial.println("ESProFile is ready!"); // And print a ready message
+  lisanetStableCycles = getCpuFrequencyMhz() * 1000UL * LISANET_MODE_STABLE_MS; // For lisanetIdlePoll() below
   noInterrupts(); // We need speed here and can't let FreeRTOS preempt us (can be up to 2ms of delay), so disable interrupts
+}
+
+// ---- LisaNet (NOT part of upstream ESProFile; written with an AI assistant -- see lisanet.h) ----
+// Watches the MODE line between ProFile commands, and restarts into the SD server once the LisaFPGA menu asks for
+// WIFI HDD. Interrupts are off here, so time is kept with the CPU cycle counter rather than millis(). The request test
+// matches lisanetModeRequestedAtBoot(): MODE high for LISANET_MODE_STABLE_MS with the link input seen high.
+// (Its state variables are declared above emulatorSetup(), which sets lisanetStableCycles.)
+void lisanetSwitchToServer(){
+  disk.close(); // Every block write is already flushed (see the write path); this just releases the image
+  interrupts();
+  Serial.println("[lisanet] MODE is WIFI HDD: restarting into the SD server");
+  Serial.flush();
+  delay(20);
+  ESP.restart();
+}
+
+inline __attribute__((__always_inline__)) void lisanetIdlePoll(){
+  uint32_t in = REG_READ(GPIO_IN1_REG); // GPIO32-63
+  if(!(in & (1UL << (LISANET_MODE_PIN - 32)))){ // MODE low: nothing requested
+    lisanetHigh = false;
+    return;
+  }
+  uint32_t now = ESP.getCycleCount();
+  if(!lisanetHigh){ // MODE just went high: start timing
+    lisanetHigh = true;
+    lisanetSince = now;
+    lisanetLinkSeen = false;
+  }
+  if(in & (1UL << (LISANET_LINK_RX_PIN - 32))){
+    lisanetLinkSeen = true;
+  }
+  if(lisanetLinkSeen && (uint32_t)(now - lisanetSince) >= lisanetStableCycles){
+    lisanetSwitchToServer();
+  }
 }
 
 void emulatorLoop() {
   clearBSY(); // Make sure we're not telling the host we're busy
-  while(readCMD() == 1); // Wait for CMD to go low (the start of a ProFile handshake)
+  lisanetIdlePoll(); // Also here, so MODE is still watched when CMD is stuck low (the handshake keeps timing out)
+  while(readCMD() == 1){ // Wait for CMD to go low (the start of a ProFile handshake)
+    lisanetIdlePoll(); // LisaNet: between commands, the only safe moment to hand the SD card over
+  }
   setParallelDir(1); // Set the ProFile bus to output mode
   //delayMicroseconds(1);
   sendData(0x01); // Send an 0x01 to the host
