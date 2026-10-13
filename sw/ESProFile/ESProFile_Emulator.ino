@@ -106,12 +106,23 @@ void emulatorSetup(){
 // WIFI HDD. Interrupts are off here, so time is kept with the CPU cycle counter rather than millis(). The request test
 // matches lisanetModeRequestedAtBoot(): MODE high for LISANET_MODE_STABLE_MS with the link input seen high.
 // (Its state variables are declared above emulatorSetup(), which sets lisanetStableCycles.)
+// MODE as a bit of GPIO_IN1_REG (GPIO32-63), and PRES too: the transfer loops below test both with ONE register read,
+// so watching MODE costs them nothing at 75 MHz. MODE can only go high while the Lisa is off (the LisaFPGA menu refuses
+// ESP32 MODE changes while it is on), so a transfer loop that sees it is not interrupting a real transfer -- it is
+// stuck on a bus the Lisa abandoned at power-off, and leaving lets lisanetIdlePoll() hand the card over.
+#if PRES_Pin < 32 || LISANET_MODE_PIN < 32
+#error "the transfer loops test PRES and MODE in one GPIO_IN1_REG read"
+#endif
+#define PRES_BIT (1UL << PRESPin)
+#define LISANET_MODE_BIT (1UL << (LISANET_MODE_PIN - 32))
+inline __attribute__((__always_inline__)) bool lisanetModeHigh(){
+  return REG_READ(GPIO_IN1_REG) & LISANET_MODE_BIT;
+}
 void lisanetSwitchToServer(){
   disk.close(); // Every block write is already flushed (see the write path); this just releases the image
   interrupts();
-  Serial.println("[lisanet] MODE is WIFI HDD: restarting into the SD server");
-  Serial.flush();
-  delay(20);
+  // No USB message: after a long stretch with interrupts off the USB console may not be usable, and a print that
+  // blocks here would leave the drive stuck in neither personality
   ESP.restart();
 }
 
@@ -176,6 +187,9 @@ void emulatorLoop() {
   clearBSY(); // Raise BSY to show that we're ready to receive a command
 
   receiveCommand(); // Now receive the command from the host
+  if(lisanetModeHigh()){ // The loop gave up because MODE went high: don't act on a half-received command
+    return;
+  }
 
   if(commandBuffer[0] == 0x00){
     readDrive(); // If the first byte of the command is 0, then it's a read command
@@ -200,7 +214,7 @@ void emulatorLoop() {
 // That wouldn't normally be a problem, but when LisaFPGA is running at 75MHz, timings are tight enough that cache misses break things
 // The symptom is that the very first read op doesn't work, but subsequent ones do once this code is cached into IRAM
 IRAM_ATTR void sendMultiData() {
-  while(bitRead(REG_READ(CMD_IN_REG), CMDPin) == 1 && bitRead(REG_READ(PRES_IN_REG), PRESPin) == 1){ // Stay in the data-sending loop until the host lowers CMD or the drive is reset
+  while(bitRead(REG_READ(CMD_IN_REG), CMDPin) == 1 && (REG_READ(PRES_IN_REG) & (PRES_BIT | LISANET_MODE_BIT)) == PRES_BIT){ // Stay in the data-sending loop until the host lowers CMD or the drive is reset
     currentState = bitRead(REG_READ(STRB_IN_REG), STRBPin); // Read the current state of STRB
     if(currentState == 0 and prevState == 1){ // If we see a falling edge on STRB, send the next byte
       sendParity(blockData[bufferIndex]); // Send the parity for the byte
@@ -213,7 +227,7 @@ IRAM_ATTR void sendMultiData() {
 
 // This function receives bytes from the host to form the command buffer, and is in IRAM for the same reason as sendMultiData
 IRAM_ATTR void receiveCommand() {
-  while(bitRead(REG_READ(CMD_IN_REG), CMDPin) == 1 && bitRead(REG_READ(PRES_IN_REG), PRESPin) == 1){ // Stay in the command-reception loop until the host lowers CMD or the drive is reset
+  while(bitRead(REG_READ(CMD_IN_REG), CMDPin) == 1 && (REG_READ(PRES_IN_REG) & (PRES_BIT | LISANET_MODE_BIT)) == PRES_BIT){ // Stay in the command-reception loop until the host lowers CMD or the drive is reset
     currentState = bitRead(REG_READ(STRB_IN_REG), STRBPin); // Read the current state of STRB
     if(currentState == 0 and prevState == 1){ // If we see a falling edge on STRB, read the bus and store the data in the command buffer
       commandBuffer[bufferIndex] = REG_READ(BUS_IN_REG) >> busOffset;
@@ -225,7 +239,7 @@ IRAM_ATTR void receiveCommand() {
 
 // Another byte-receiving function, also in IRAM, but this one is for receiving data during a write command
 IRAM_ATTR void receiveMultiData() {
-  while(bitRead(REG_READ(CMD_IN_REG), CMDPin) == 1 && bitRead(REG_READ(PRES_IN_REG), PRESPin) == 1){ // Stay in the data-receiving loop until the host lowers CMD or the drive is reset
+  while(bitRead(REG_READ(CMD_IN_REG), CMDPin) == 1 && (REG_READ(PRES_IN_REG) & (PRES_BIT | LISANET_MODE_BIT)) == PRES_BIT){ // Stay in the data-receiving loop until the host lowers CMD or the drive is reset
     currentState = bitRead(REG_READ(STRB_IN_REG), STRBPin); // Read the current state of STRB
     if(currentState == 0 and prevState == 1){ // If we see a falling edge on STRB, it means the data is valid
       blockData[bufferIndex] = REG_READ(BUS_IN_REG) >> busOffset; // So read the data from the bus into the blockData buffer
@@ -674,6 +688,9 @@ void writeDrive(){
   clearBSY(); // Raise BSY to tell the host that we're ready to receive the data
  
   receiveMultiData(); // And receive the block data from the host
+  if(lisanetModeHigh()){ // Gave up because MODE went high: never write a half-received block
+    return;
+  }
 
   setParallelDir(1); // Set the bus to output mode
   //delayMicroseconds(1);

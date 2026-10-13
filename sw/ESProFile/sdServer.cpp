@@ -20,7 +20,7 @@ enum : uint8_t { ST_OK = 0, ST_NOT_FOUND, ST_EXISTS, ST_IO, ST_BAD_REQUEST, ST_N
                  ST_NO_CONTIGUOUS };
 enum : uint8_t {
     CMD_HELLO = 0x01, CMD_INFO = 0x02, CMD_LIST = 0x10, CMD_STAT = 0x11, CMD_OPEN = 0x20, CMD_READ = 0x21,
-    CMD_WRITE = 0x22, CMD_CLOSE = 0x23, CMD_DELETE = 0x30, CMD_RENAME = 0x31, CMD_MKDIR = 0x32,
+    CMD_WRITE = 0x22, CMD_CLOSE = 0x23, CMD_DELETE = 0x30, CMD_RENAME = 0x31, CMD_MKDIR = 0x32, CMD_COPY_START = 0x33, CMD_COPY_STEP = 0x34,
     CMD_MOUNT_NEXT_SET = 0x40, CMD_MOUNT_NEXT_GET = 0x41
 };
 
@@ -87,8 +87,60 @@ static bool getPath(const uint8_t *p, size_t n, char *out, size_t cap) {
     return true;
 }
 
+// Staging. An upload (OPEN mode 3) or a copy is written under a temporary name in the hidden /.LISANET folder and moved
+// onto its real name only once complete, inside ONE request (the CLOSE, or the last COPY_STEP). The server checks MODE
+// between requests, so a mode change -- e.g. the Lisa being switched on in WIFI HDD -- can only land before or after
+// that move: the target is always either the old file or the complete new one, never a half-written image. Temporary
+// files left by an interruption are deleted at the next start.
+#define STAGE_DIR   "/.LISANET"
+#define UPLOAD_TEMP STAGE_DIR "/UPLOAD.PRT"
+#define COPY_TEMP   STAGE_DIR "/COPY.PRT"
+static bool uploadStaged = false;
+static char uploadTarget[256];
+
+// Moves a finished staged file onto target. An existing target is first renamed to backup, or deleted if backup is
+// empty or null.
+static uint8_t commitStaged(const char *temp, const char *target, const char *backup) {
+    if (SDCard.exists(target)) {
+        File32 t;
+        if (t.open(target, O_RDONLY)) { bool dir = t.isDir(); t.close(); if (dir) return ST_EXISTS; }
+        if (backup && *backup) {
+            if (SDCard.exists(backup)) return ST_EXISTS;
+            if (!SDCard.rename(target, backup)) return ST_IO;
+        } else if (!SDCard.remove(target)) {
+            return ST_IO;
+        }
+    }
+    return SDCard.rename(temp, target) ? ST_OK : ST_IO;
+}
+
+// Closes whatever is open WITHOUT completing it: a staged upload is discarded (its target is untouched); a plain file
+// is synced and closed.
 static void closeOpenFile() {
-    if (fileOpen) { openFile.sync(); openFile.close(); fileOpen = false; }
+    if (!fileOpen) return;
+    if (uploadStaged) { openFile.close(); SDCard.remove(UPLOAD_TEMP); uploadStaged = false; }
+    else { openFile.sync(); openFile.close(); }
+    fileOpen = false;
+}
+
+// On-card copy (COPY_START / COPY_STEP): one copy at a time, done in pieces so each request answers quickly and the
+// client can show progress. Staged like an upload (see above) and reserved contiguously first; a copy that fails or is
+// abandoned (MODE dropping, or a new COPY_START) just deletes its temporary file.
+#define COPY_STEP_BYTES (1024UL * 1024UL)       // per COPY_STEP: about a second of card time
+static File32 copySrc, copyDst;
+static bool copying = false;
+static uint64_t copyDone = 0, copyTotal = 0;
+static char copyDstPath[256];
+static bool copyReplace = false;                // the target may already exist (it is then replaced)
+static char copyBackup[256];                    // ...and renamed to this first, or deleted if empty
+static uint8_t copyBuf[16384];
+
+static void copyAbort() {
+    if (!copying) return;
+    copySrc.close();
+    copyDst.close();
+    SDCard.remove(COPY_TEMP);
+    copying = false;
 }
 
 // ---- Command handlers --------------------------------------------------------------------------
@@ -148,15 +200,23 @@ static void handle(uint8_t cmd, const uint8_t *p, size_t n) {
         if (mode > 3 || n < pathAt || !getPath(p + pathAt, n - pathAt, path, sizeof path)) { begin(ST_BAD_REQUEST); return; }
         closeOpenFile();
         oflag_t fl = mode == 0 ? O_RDONLY : mode == 2 ? (O_RDWR | O_CREAT) : (O_RDWR | O_CREAT | O_TRUNC);
-        if (!openFile.open(path, fl)) { begin(mode == 0 ? ST_NOT_FOUND : ST_IO); return; }
+        const char *openPath = path;
+        if (mode == 3) {                         // staged: written under a temporary name, moved into place by CLOSE
+            SDCard.mkdir(STAGE_DIR, true);
+            SDCard.remove(UPLOAD_TEMP);
+            strcpy(uploadTarget, path);
+            openPath = UPLOAD_TEMP;
+        }
+        if (!openFile.open(openPath, fl)) { begin(mode == 0 ? ST_NOT_FOUND : ST_IO); return; }
         if (mode == 3) {
             uint64_t size = rd64(p + 1);
             if (size && !openFile.preAllocate(size)) {
                 openFile.close();
-                SDCard.remove(path);
+                SDCard.remove(UPLOAD_TEMP);
                 begin(ST_NO_CONTIGUOUS);
                 return;
             }
+            uploadStaged = true;
         }
         fileOpen = true;
         begin(ST_OK); put8(HANDLE); put64(openFile.fileSize());
@@ -186,10 +246,19 @@ static void handle(uint8_t cmd, const uint8_t *p, size_t n) {
         break;
     }
     case CMD_CLOSE: {
+        // u8 handle [, u8 abandon]. Completes the open file; for a staged upload that means moving it into place.
+        // abandon = 1 instead discards a staged upload (the client gave up on it), leaving its target untouched.
         if (!fileOpen) { begin(ST_OK); return; }       // repeating a CLOSE is harmless
+        if (n >= 2 && p[1] == 1) { closeOpenFile(); begin(ST_OK); return; }
         bool ok = openFile.sync();
         openFile.close();
         fileOpen = false;
+        if (uploadStaged) {
+            uploadStaged = false;
+            if (!ok) { SDCard.remove(UPLOAD_TEMP); begin(ST_IO); return; }
+            begin(commitStaged(UPLOAD_TEMP, uploadTarget, nullptr));
+            return;
+        }
         begin(ok ? ST_OK : ST_IO);
         break;
     }
@@ -223,6 +292,62 @@ static void handle(uint8_t cmd, const uint8_t *p, size_t n) {
     case CMD_MOUNT_NEXT_GET:
         begin(ST_OK);
         break;
+    case CMD_COPY_START: {
+        // source, NUL, target [, NUL, backup]. With the third field the target may already exist: once the copy is
+        // complete it is renamed to backup (or deleted, if backup is empty) and replaced, in the same request.
+        const uint8_t *z = (const uint8_t *)memchr(p, 0, n);
+        if (!z) { begin(ST_BAD_REQUEST); return; }
+        const uint8_t *d = z + 1;
+        size_t dn = n - (d - p);
+        const uint8_t *z2 = (const uint8_t *)memchr(d, 0, dn);
+        bool replace = z2 != nullptr;
+        size_t dlen = replace ? (size_t)(z2 - d) : dn;
+        size_t blen = replace ? dn - dlen - 1 : 0;
+        if (!getPath(p, z - p, path, sizeof path) || !getPath(d, dlen, path2, sizeof path2) || blen >= sizeof copyBackup) {
+            begin(ST_BAD_REQUEST); return;
+        }
+        copyAbort();
+        if (replace) memcpy(copyBackup, z2 + 1, blen);
+        copyBackup[blen] = 0;
+        copyReplace = replace;
+        if (!SDCard.exists(path)) { begin(ST_NOT_FOUND); return; }
+        if (!replace && SDCard.exists(path2)) { begin(ST_EXISTS); return; }
+        if (copyBackup[0] && SDCard.exists(copyBackup)) { begin(ST_EXISTS); return; }
+        if (!copySrc.open(path, O_RDONLY)) { begin(ST_IO); return; }
+        if (copySrc.isDir()) { copySrc.close(); begin(ST_BAD_REQUEST); return; }
+        SDCard.mkdir(STAGE_DIR, true);
+        SDCard.remove(COPY_TEMP);
+        if (!copyDst.open(COPY_TEMP, O_RDWR | O_CREAT | O_TRUNC)) { copySrc.close(); begin(ST_IO); return; }
+        strcpy(copyDstPath, path2);
+        copyTotal = copySrc.fileSize();
+        copyDone = 0;
+        copying = true;
+        if (copyTotal && !copyDst.preAllocate(copyTotal)) { copyAbort(); begin(ST_NO_CONTIGUOUS); return; }
+        begin(ST_OK); put64(copyTotal);
+        break;
+    }
+    case CMD_COPY_STEP: {
+        if (!copying) { begin(ST_NO_HANDLE); return; }
+        uint64_t stepEnd = copyDone + COPY_STEP_BYTES;
+        while (copyDone < copyTotal && copyDone < stepEnd) {
+            size_t want = (size_t)min((uint64_t)sizeof copyBuf, copyTotal - copyDone);
+            int got = copySrc.read(copyBuf, want);
+            if (got <= 0 || copyDst.write(copyBuf, got) != (size_t)got) { copyAbort(); begin(ST_IO); return; }
+            copyDone += got;
+        }
+        if (copyDone == copyTotal) {
+            bool ok = copyDst.sync();
+            copySrc.close();
+            copyDst.close();
+            copying = false;
+            if (!ok) { SDCard.remove(COPY_TEMP); begin(ST_IO); return; }
+            if (!copyReplace && SDCard.exists(copyDstPath)) { SDCard.remove(COPY_TEMP); begin(ST_EXISTS); return; }
+            uint8_t st = commitStaged(COPY_TEMP, copyDstPath, copyBackup);   // the move into place
+            if (st != ST_OK) { SDCard.remove(COPY_TEMP); begin(st); return; }
+        }
+        begin(ST_OK); put64(copyDone); put64(copyTotal);
+        break;
+    }
     default:
         begin(ST_UNKNOWN_CMD);
     }
@@ -273,6 +398,11 @@ static Receiver usbRx, linkRx;
 
 [[noreturn]] void sdServerMain() {
     crcInit();
+#ifdef red_led
+    // ESProFile: amber (red + green) while serving, so the LED tells the personalities apart (green = the hard disk)
+    analogWrite(red_led, red_pwm_duty);
+    analogWrite(green_led, green_pwm_duty);
+#endif
     // USB: a 4 KB READ response must go out whole. ESProFile's console sets a zero TX timeout (never block), which
     // silently drops whatever does not fit the small default buffer -- so give it a big buffer and let it wait.
     Serial.setTxBufferSize(8192);
@@ -287,6 +417,7 @@ static Receiver usbRx, linkRx;
     SD_SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
     cardOk = SDCard.begin(SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SCK_MHZ(20), &SD_SPI));
     Serial.println(cardOk ? "[sdServer] SD card mounted" : "[sdServer] SD card NOT mounted");
+    if (cardOk) { SDCard.remove(UPLOAD_TEMP); SDCard.remove(COPY_TEMP); }   // left by an interrupted upload or copy
 
     usbRx.s = &Serial;
     linkRx.s = &Link;
@@ -294,6 +425,7 @@ static Receiver usbRx, linkRx;
         // MODE dropped (FLOPPY or WIFI FDD): close any open file (synced) and restart into ESProFile
         if (lisanetModeStableAt(LOW)) {
             closeOpenFile();
+            copyAbort();
             Serial.println("[sdServer] MODE dropped: restarting into ESProFile");
             Serial.flush();
             delay(20);
